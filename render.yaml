@@ -1,8 +1,8 @@
-services:
+﻿services:
   - type: web
     name: anime-arena-server
     runtime: node
-    plan: starter
+    plan: free
     region: singapore
     buildCommand: npm ci && npm run build
     startCommand: npm run start --workspace=@anime-arena/server
@@ -13,10 +13,6 @@ services:
       - key: SESSION_SECRET
         generateValue: true
       - key: SQLITE_PATH
-        value: /var/data/anime_arena.db
+        value: ./anime_arena.db
       - key: CLIENT_ORIGIN
         sync: false
-    disk:
-      name: anime-arena-data
-      mountPath: /var/data
-      sizeGB: 1
