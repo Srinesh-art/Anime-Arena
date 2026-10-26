@@ -1,5 +1,5 @@
-﻿import React, { useState, useEffect } from 'react';
-import { socket, SERVER_URL, getSessionIdentity, type SessionIdentity } from './lib/socket';
+import React, { useState, useEffect } from 'react';
+import { socket, SERVER_URL, isBackendConfigured, getSessionIdentity, type SessionIdentity } from './lib/socket';
 import type { DraftState, Player, Character, DraftPick } from './types';
 import {
   Swords,
@@ -46,6 +46,7 @@ export function App() {
   const [joinCodeInput, setJoinCodeInput] = useState('');
   const [copiedCode, setCopiedCode] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [backendConnected, setBackendConnected] = useState(socket.connected);
 
   // Search & Filters for Draft and Catalogue
   const [searchQuery, setSearchQuery] = useState('');
@@ -89,6 +90,12 @@ export function App() {
         return next;
       });
     };
+    const onConnect = () => setBackendConnected(true);
+    const onDisconnect = () => setBackendConnected(false);
+    const onConnectError = () => setBackendConnected(false);
+    socket.on('connect', onConnect);
+    socket.on('disconnect', onDisconnect);
+    socket.on('connect_error', onConnectError);
     socket.on('session:identity', applySessionIdentity);
     const existingIdentity = getSessionIdentity();
     if (existingIdentity) applySessionIdentity(existingIdentity);
@@ -112,6 +119,9 @@ export function App() {
     });
 
     return () => {
+      socket.off('connect', onConnect);
+      socket.off('disconnect', onDisconnect);
+      socket.off('connect_error', onConnectError);
       socket.off('session:identity', applySessionIdentity);
       socket.off('draft:state');
       socket.off('draft:pick:rejected');
@@ -134,6 +144,8 @@ export function App() {
   // Actions
   const handleCreateRoom = (isCrossVerse: boolean = true) => {
     setErrorMessage(null);
+    if (!isBackendConfigured) { setErrorMessage('Multiplayer server is not configured yet. Please try again after the backend is deployed.'); return; }
+    if (!socket.connected) { setErrorMessage('Cannot reach the multiplayer server yet. It may be starting up; wait a few seconds and try again.'); return; }
     const hostUser: Player = { ...currentUser, isHost: true };
     setCurrentUser(hostUser);
 
@@ -297,6 +309,11 @@ export function App() {
 
       {/* Main Content View Switcher */}
       <main className="flex-1 flex flex-col">
+        {!backendConnected && (
+          <div role="status" className="mx-auto mt-4 max-w-2xl px-4 py-3 rounded-xl border border-amber-500/30 bg-amber-500/10 text-amber-200 text-sm text-center">
+            Multiplayer server is not connected. Room creation and joining will not work until the backend is online.
+          </div>
+        )}
         {/* VIEW 1: HOME PAGE */}
         {activeTab === 'HOME' && (
           <div className="flex-1 flex flex-col justify-center items-center px-4 py-12 max-w-5xl mx-auto w-full">
