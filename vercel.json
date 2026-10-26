@@ -1,0 +1,6 @@
+{
+  "buildCommand": "npm run build --workspace=@anime-arena/shared && npm run build --workspace=@anime-arena/web",
+  "outputDirectory": "apps/web/dist",
+  "installCommand": "npm ci",
+  "framework": "vite"
+}

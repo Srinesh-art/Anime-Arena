@@ -85,3 +85,41 @@ cd ../../apps/server && npm run build
 cd ../web && npm run build
 ```
 Frontend static assets are generated in `apps/web/dist/` ready to host on Vercel, Cloudflare Pages, or Netlify, with the persistent Socket.IO server deployable to Render, Railway, Fly.io, or any Node.js container environment.
+
+---
+
+## 5. Production Deployment
+
+### Architecture
+- Frontend: Vercel builds the @anime-arena/web workspace from the monorepo root using vercel.json.
+- Backend: Render runs the persistent Express + Socket.IO service using render.yaml.
+- Database: SQLite is stored at /var/data/anime_arena.db on a Render persistent disk. Render Free web services do not support persistent disks; select an eligible paid service plan before creating the backend.
+- Guest identity: The backend issues a signed guest-session token. Set SESSION_SECRET to a strong persistent secret in production. Do not expose it to the frontend.
+- CORS: Set CLIENT_ORIGIN to the exact public frontend origin (for example, the Vercel production domain). Multiple comma-separated origins are supported.
+
+### Required production configuration
+
+Backend environment variables:
+- NODE_ENV=production
+- SESSION_SECRET — strong server-side secret; Render can generate one from the Blueprint.
+- SQLITE_PATH=/var/data/anime_arena.db
+- CLIENT_ORIGIN=https://your-frontend-domain.vercel.app
+- PORT is provided by Render automatically.
+
+Frontend environment variable:
+- VITE_SERVER_URL=https://your-backend-service.onrender.com
+
+### Deployment order
+1. Push the repository to GitHub and connect it to Vercel and Render.
+2. Create the Render Web Service from render.yaml; attach its 1 GB persistent disk. This is a paid resource.
+3. Set CLIENT_ORIGIN in Render to the frontend origin. The production server intentionally refuses to start without this value and SESSION_SECRET.
+4. Configure VITE_SERVER_URL in Vercel to the Render service URL, then redeploy the frontend.
+5. Verify GET /api/health, catalogue endpoints, Socket.IO guest-session issuance, room creation/join, host authorization, canonical character picks, and reconnect/restart recovery.
+
+### CI
+GitHub Actions runs npm ci, npm test, and npm run build on pushes and pull requests to main.
+
+### Notes
+- The SQLite database is local to a single Render instance; do not scale the service horizontally while using this database.
+- A guest token is a bearer credential. Do not share it; clearing browser storage creates a new guest identity.
+- Room recovery preserves stored room state and grants the current player a fresh turn deadline after a backend restart.

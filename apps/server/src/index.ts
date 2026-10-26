@@ -2,26 +2,64 @@ import express from 'express';
 import http from 'http';
 import { Server, Socket } from 'socket.io';
 import cors from 'cors';
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import { db, initDb } from './db/schema';
 import { seedCatalogue } from './db/seed';
 import { RoomManager } from './engine/RoomManager';
-import { Player, Character, RoomSettings } from '@anime-arena/shared';
+import { Player, Character, RoomSettings, PlayerSchema, RoomCodeSchema, RoomSettingsSchema } from '@anime-arena/shared';
 
 const app = express();
 const server = http.createServer(app);
 
-app.use(cors({ origin: '*' }));
+const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173,http://127.0.0.1:5173')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+if (process.env.NODE_ENV === 'production' && !process.env.CLIENT_ORIGIN) {
+  throw new Error('CLIENT_ORIGIN must be configured in production.');
+}
+app.use(cors({ origin: allowedOrigins }));
 app.use(express.json());
 
 // Initialize SQLite database and seed initial catalogue
 initDb();
 seedCatalogue();
+RoomManager.restoreRooms();
 
 const io = new Server(server, {
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+  cors: { origin: allowedOrigins, methods: ['GET', 'POST'] }
+});
+
+const SESSION_SECRET = process.env.SESSION_SECRET ||
+  (process.env.NODE_ENV === 'production' ? '' : randomBytes(32).toString('hex'));
+if (!SESSION_SECRET) throw new Error('SESSION_SECRET must be configured in production.');
+
+function signSessionToken(playerId: string): string {
+  const payload = Buffer.from(JSON.stringify({ sub: playerId })).toString('base64url');
+  const signature = createHmac('sha256', SESSION_SECRET).update(payload).digest('base64url');
+  return payload + '.' + signature;
+}
+
+function verifySessionToken(token: unknown): string | null {
+  if (typeof token !== 'string' || token.length > 1024) return null;
+  const parts = token.split('.');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  try {
+    const expected = createHmac('sha256', SESSION_SECRET).update(parts[0]).digest();
+    const actual = Buffer.from(parts[1], 'base64url');
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
+    const payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
+    return typeof payload.sub === 'string' && payload.sub.length >= 16 ? payload.sub : null;
+  } catch { return null; }
+}
+
+io.use((socket, next) => {
+  const suppliedToken = socket.handshake.auth?.sessionToken;
+  const verifiedId = verifySessionToken(suppliedToken);
+  const playerId = verifiedId || randomUUID();
+  socket.data.playerId = playerId;
+  socket.data.sessionToken = verifiedId ? suppliedToken : signSessionToken(playerId);
+  next();
 });
 
 // REST API Endpoints
@@ -81,21 +119,27 @@ app.get('/api/catalogue/characters', (req, res) => {
   res.json({ characters, count: characters.length });
 });
 
-// Real-time Turn Timer Engine
+// Server-authoritative turn timeout processing.
 setInterval(() => {
-  // Check active rooms for timer expiry
-  const now = Date.now();
-  // Using RoomManager state
-  // In a production server, active rooms can be traversed
-}, 1000);
+  for (const result of RoomManager.processExpiredTurns()) {
+    if (result.pick) io.to(result.state.roomCode).emit('draft:pick:accepted', { pick: result.pick, state: result.state });
+    io.to(result.state.roomCode).emit('draft:state', result.state);
+  }
+}, 1000).unref();
 
 // Socket.IO Real-time Connection Handlers
 io.on('connection', (socket: Socket) => {
   let currentRoomCode: string | null = null;
   let currentPlayerId: string | null = null;
+  socket.emit('session:identity', { playerId: socket.data.playerId as string, sessionToken: socket.data.sessionToken as string });
 
-  socket.on('room:create', ({ player, settings }: { player: Player; settings: Partial<RoomSettings> }, callback) => {
+  socket.on('room:create', (payload: { player?: Partial<Player>; settings?: Partial<RoomSettings> } | null, callback) => {
     try {
+      const parsedPlayer = PlayerSchema.safeParse({ ...payload?.player, id: socket.data.playerId, isHost: true, isReady: false, connected: true, joinedAt: Date.now() });
+      const parsedSettings = RoomSettingsSchema.partial().safeParse(payload?.settings ?? {});
+      if (!parsedPlayer.success || !parsedSettings.success) { callback?.({ success: false, error: 'Invalid player or room settings.' }); return; }
+      const player = parsedPlayer.data;
+      const settings = parsedSettings.data;
       const state = RoomManager.createRoom(player, settings);
       currentRoomCode = state.roomCode;
       currentPlayerId = player.id;
@@ -108,8 +152,13 @@ io.on('connection', (socket: Socket) => {
     }
   });
 
-  socket.on('room:join', ({ roomCode, player }: { roomCode: string; player: Player }, callback) => {
+  socket.on('room:join', (payload: { roomCode?: unknown; player?: Partial<Player> } | null, callback) => {
     try {
+      const parsedCode = RoomCodeSchema.safeParse(payload?.roomCode);
+      const parsedPlayer = PlayerSchema.safeParse({ ...payload?.player, id: socket.data.playerId, isHost: false, isReady: false, connected: true, joinedAt: Date.now() });
+      if (!parsedCode.success || !parsedPlayer.success) { callback?.({ success: false, error: 'Invalid room code or player details.' }); return; }
+      const roomCode = parsedCode.data;
+      const player = parsedPlayer.data;
       const result = RoomManager.joinRoom(roomCode, player);
       if (result.error || !result.state) {
         if (callback) callback({ success: false, error: result.error || 'Failed to join' });
@@ -135,9 +184,11 @@ io.on('connection', (socket: Socket) => {
     }
   });
 
-  socket.on('room:settings:update', ({ settings }: { settings: Partial<RoomSettings> }, callback) => {
+  socket.on('room:settings:update', (payload: { settings?: Partial<RoomSettings> } | null, callback) => {
     if (!currentRoomCode || !currentPlayerId) return;
-    const result = RoomManager.updateSettings(currentRoomCode, currentPlayerId, settings);
+    const parsedSettings = RoomSettingsSchema.partial().safeParse(payload?.settings ?? {});
+    if (!parsedSettings.success) { callback?.({ success: false, error: 'Invalid room settings.' }); return; }
+    const result = RoomManager.updateSettings(currentRoomCode, currentPlayerId, parsedSettings.data);
     if (result.error) {
       if (callback) callback({ success: false, error: result.error });
       return;
@@ -161,9 +212,15 @@ io.on('connection', (socket: Socket) => {
     }
   });
 
-  socket.on('draft:pick', ({ character }: { character: Character }, callback) => {
+  socket.on('draft:pick', (payload: { character?: { id?: unknown } } | null, callback) => {
     if (!currentRoomCode || !currentPlayerId) return;
-    const result = RoomManager.makePick(currentRoomCode, currentPlayerId, character);
+    const characterId = payload?.character?.id;
+    if (typeof characterId !== 'string' || characterId.length < 1 || characterId.length > 100) {
+      callback?.({ success: false, error: 'Invalid character selection.' });
+      socket.emit('draft:pick:rejected', { reason: 'Invalid character selection.' });
+      return;
+    }
+    const result = RoomManager.makePick(currentRoomCode, currentPlayerId, { id: characterId } as Character);
     if (result.error) {
       if (callback) callback({ success: false, error: result.error });
       socket.emit('draft:pick:rejected', { reason: result.error });

@@ -3,7 +3,8 @@ import {
   Player,
   RoomSettings,
   Character,
-  DraftPick
+  DraftPick,
+  DraftStateSchema
 } from '@anime-arena/shared';
 import { GameEngine } from './GameEngine';
 import { db } from '../db/schema';
@@ -49,7 +50,7 @@ export class RoomManager {
       roomCode: code,
       phase: 'LOBBY',
       settings: initialSettings,
-      players: [hostPlayer],
+      players: [{ ...hostPlayer, isHost: true, connected: true }],
       currentRound: 1,
       currentPickIndex: 0,
       currentTurnPlayerId: null,
@@ -88,7 +89,7 @@ export class RoomManager {
       return { error: 'Room is full' };
     }
 
-    state.players.push(player);
+    state.players.push({ ...player, isHost: false, connected: true });
     this.persistRoom(state);
     return { state };
   }
@@ -186,12 +187,29 @@ export class RoomManager {
     const state = this.getRoom(code);
     if (!state) return { error: 'Room not found' };
 
-    const validation = GameEngine.validatePick(state, playerId, character);
+    // Never trust client-supplied character attributes. Resolve the canonical record from SQLite.
+    const row = db.prepare('SELECT * FROM characters WHERE id = ?').get(character?.id) as any;
+    if (!row) return { error: 'Character does not exist in the catalogue' };
+    const canonicalCharacter: Character = {
+      id: row.id,
+      canonicalId: row.canonical_id,
+      animeId: row.anime_id,
+      franchise: row.franchise,
+      name: row.name,
+      originalName: row.original_name,
+      aliases: JSON.parse(row.aliases || '[]'),
+      form: row.form || 'Base',
+      imageUrl: row.image_url || '',
+      role: row.role || undefined,
+      description: row.description || undefined
+    };
+
+    const validation = GameEngine.validatePick(state, playerId, canonicalCharacter);
     if (!validation.valid) {
       return { error: validation.reason || 'Invalid pick' };
     }
 
-    const { nextState, pick } = GameEngine.applyPick(state, playerId, character);
+    const { nextState, pick } = GameEngine.applyPick(state, playerId, canonicalCharacter);
     this.rooms.set(code, nextState);
     this.persistRoom(nextState);
 
@@ -231,6 +249,50 @@ export class RoomManager {
       const draftedIds = new Set(state.picks.map(p => p.character.id));
       return filtered.filter(c => !draftedIds.has(c.id));
     }
+  }
+
+  public static restoreRooms(): number {
+    this.rooms.clear();
+    const rows = db.prepare('SELECT state_json FROM rooms ORDER BY updated_at DESC').all() as Array<{ state_json: string }>;
+    let restored = 0;
+    for (const row of rows) {
+      try {
+        const parsed = DraftStateSchema.safeParse(JSON.parse(row.state_json));
+        if (!parsed.success) {
+          console.warn('[RoomManager] Skipping invalid persisted room state.');
+          continue;
+        }
+        const state = parsed.data;
+        for (const player of state.players) player.connected = false;
+        if (state.phase === 'ACTIVE_DRAFT' && state.currentTurnPlayerId) {
+          state.turnDeadline = Date.now() + state.settings.turnDuration * 1000;
+        }
+        this.rooms.set(state.roomCode, state);
+        this.persistRoom(state);
+        restored++;
+      } catch (error) {
+        console.error('[RoomManager] Could not restore persisted room:', error);
+      }
+    }
+    console.log('[RoomManager] Restored ' + restored + ' persisted rooms.');
+    return restored;
+  }
+
+  public static processExpiredTurns(): Array<{ state: DraftState; pick?: DraftPick }> {
+    const results: Array<{ state: DraftState; pick?: DraftPick }> = [];
+    const now = Date.now();
+    for (const state of this.rooms.values()) {
+      if (state.phase !== 'ACTIVE_DRAFT' || state.turnDeadline === null || state.turnDeadline > now) continue;
+      if (!state.settings.autoPickOnTimeout) {
+        state.turnDeadline = now + state.settings.turnDuration * 1000;
+        this.persistRoom(state);
+        results.push({ state });
+        continue;
+      }
+      const result = this.autoPick(state.roomCode);
+      if (result.state) results.push({ state: result.state, pick: result.pick });
+    }
+    return results;
   }
 
   public static autoPick(code: string): { state?: DraftState; pick?: DraftPick } {
