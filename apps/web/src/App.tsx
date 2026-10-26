@@ -1,5 +1,5 @@
 ﻿import React, { useState, useEffect } from 'react';
-import { socket, SERVER_URL } from './lib/socket';
+import { socket, SERVER_URL, getSessionIdentity, type SessionIdentity } from './lib/socket';
 import type { DraftState, Player, Character, DraftPick } from './types';
 import {
   Swords,
@@ -80,14 +80,18 @@ export function App() {
 
   // Socket Listener lifecycle
   useEffect(() => {
-    socket.on('session:identity', ({ playerId, sessionToken }: { playerId: string; sessionToken: string }) => {
+    const applySessionIdentity = ({ playerId, sessionToken }: SessionIdentity) => {
       localStorage.setItem('anime_arena_session_token', sessionToken);
       setCurrentUser((previous) => {
+        if (previous.id === playerId && previous.connected) return previous;
         const next = { ...previous, id: playerId, isHost: false, connected: true };
         localStorage.setItem('anime_arena_user', JSON.stringify(next));
         return next;
       });
-    });
+    };
+    socket.on('session:identity', applySessionIdentity);
+    const existingIdentity = getSessionIdentity();
+    if (existingIdentity) applySessionIdentity(existingIdentity);
 
     socket.on('draft:state', (newState: DraftState) => {
       setDraftState(newState);
@@ -108,7 +112,7 @@ export function App() {
     });
 
     return () => {
-      socket.off('session:identity');
+      socket.off('session:identity', applySessionIdentity);
       socket.off('draft:state');
       socket.off('draft:pick:rejected');
     };
